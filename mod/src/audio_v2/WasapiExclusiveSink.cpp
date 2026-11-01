@@ -295,6 +295,18 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
     if (state_.load(std::memory_order_acquire) != WasapiSinkState::Open || !client_ || !render_) {
         return finish(E_UNEXPECTED);
     }
+    if (keepAlivePaused_.load(std::memory_order_acquire)) {
+        // The render worker and physical client stayed live. Preserve the
+        // exact source/queue identity and switch from silence to media at the
+        // next packet boundary; no Stop/Start/Reset or extra priming occurs.
+        if (source_ != &source || !renderThread_) return finish(E_INVALIDARG);
+        auto expected = WasapiSinkState::Open;
+        if (!state_.compare_exchange_strong(expected, WasapiSinkState::Running,
+                                            std::memory_order_acq_rel)) return finish(E_UNEXPECTED);
+        keepAlivePaused_.store(false, std::memory_order_release);
+        NotifyLifecycle(WasapiSinkLifecycleEvent::ResumeKeepAlive, S_OK);
+        return finish(S_OK);
+    }
     if (!shutdownEvent_ || !ResetEvent(shutdownEvent_)) {
         const auto error = HRESULT_FROM_WIN32(GetLastError());
         RecordError(error);
@@ -382,30 +394,49 @@ HRESULT WasapiExclusiveSink::Start(IIntegerPcmSource& source) noexcept {
     return finish(S_OK);
 }
 
-HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
+HRESULT WasapiExclusiveSink::RenderOneBuffer(bool pauseSilence) noexcept {
     if (!source_) return E_UNEXPECTED;
-    HRESULT prepared = source_->Prepare(bufferFrames_);
+    bool starvationSilence = false;
+    HRESULT prepared = pauseSilence ? S_OK : source_->Prepare(bufferFrames_);
     if (prepared == kAudioSourceWouldBlock) {
         // Publish the waiting state before the second availability check. A
         // producer that races the first check will either be observed here or
         // see waitingForSource_ and signal sourceReadyEvent_, so no wakeup is
         // lost while healthy playback avoids producer-cadence event traffic.
-        waitingForSource_.store(true, std::memory_order_release);
+        const bool wasWaiting = waitingForSource_.exchange(true, std::memory_order_acq_rel);
         prepared = source_->Prepare(bufferFrames_);
         if (prepared == kAudioSourceWouldBlock) {
-            sourceWaits_.fetch_add(1, std::memory_order_relaxed);
-            if (client_) {
-                const HRESULT stop = client_->Stop();
-                if (FAILED(stop) && stop != AUDCLNT_E_NOT_INITIALIZED) {
-                    RecordError(stop);
-                    state_.store(WasapiSinkState::Faulted, std::memory_order_release);
-                    return stop;
+            // Serialize only this rare stop transition with Pause. A pause
+            // racing an empty producer must not stop a client after Pause has
+            // committed to keeping it alive with silence.
+            std::lock_guard transition(pauseTransitionMutex_);
+            if (keepAlivePaused_.load(std::memory_order_acquire)) {
+                pauseSilence = true;
+                prepared = S_OK;
+            } else if (config_.keepRunningOnStarvation &&
+                       clockStartGeneration_.load(std::memory_order_acquire) != 0) {
+                // Modern Standby/display wake can briefly stop delivery even
+                // though the user never paused. Stop/Start here reproduces the
+                // same USB cadence fault as a user pause. Do not consume the
+                // source or change the format; keep the established clock live.
+                if (!wasWaiting) sourceWaits_.fetch_add(1, std::memory_order_relaxed);
+                starvationSilence = true;
+                prepared = S_OK;
+            } else {
+                if (!wasWaiting) sourceWaits_.fetch_add(1, std::memory_order_relaxed);
+                if (client_) {
+                    const HRESULT stop = client_->Stop();
+                    if (FAILED(stop) && stop != AUDCLNT_E_NOT_INITIALIZED) {
+                        RecordError(stop);
+                        state_.store(WasapiSinkState::Faulted, std::memory_order_release);
+                        return stop;
+                    }
                 }
+                return kAudioSourceWouldBlock;
             }
-            return kAudioSourceWouldBlock;
         }
-        waitingForSource_.store(false, std::memory_order_release);
     }
+    if (!starvationSilence) waitingForSource_.store(false, std::memory_order_release);
     if (FAILED(prepared)) {
         RecordError(prepared);
         return prepared;
@@ -461,7 +492,7 @@ HRESULT WasapiExclusiveSink::RenderOneBuffer() noexcept {
 
     std::uint32_t written = 0;
     bool endOfStream = false;
-    const bool silencePrime = silencePrimePending_;
+    const bool silencePrime = silencePrimePending_ || pauseSilence || starvationSilence;
     DWORD flags = 0;
     const bool directInteger32 = config_.format.containerBits == 32 &&
         config_.format.encoding == PcmEncoding::SignedInteger;
@@ -670,9 +701,11 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
     if (SUCCEEDED(apartment) || apartment == RPC_E_CHANGED_MODE) {
         HANDLE handles[3] = {shutdownEvent_, audioEvent_, config_.sourceReadyEvent};
         const DWORD handleCount = config_.sourceReadyEvent ? 3u : 2u;
+        bool wasKeepAlivePaused = false;
         while (!stopRequested_.load(std::memory_order_acquire)) {
-            const bool draining = clock_ && EndOfStreamSubmitted();
-            const DWORD waitTimeout = draining ? 20u : waitingForSource_.load(std::memory_order_acquire)
+            const bool drainWait = clock_ && EndOfStreamSubmitted() &&
+                !keepAlivePaused_.load(std::memory_order_acquire);
+            const DWORD waitTimeout = drainWait ? 20u : waitingForSource_.load(std::memory_order_acquire)
                 ? 50u
                 : (config_.sourceReadyEvent ? renderWatchdogMs_ : 20u);
             const DWORD wait = WaitForMultipleObjects(
@@ -682,6 +715,28 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
                 threadFailure = HRESULT_FROM_WIN32(GetLastError());
                 break;
             }
+            if (keepAlivePaused_.load(std::memory_order_acquire)) {
+                wasKeepAlivePaused = true;
+                // Producer notifications are not device-period grants. Only
+                // the real audio event may submit a paused silence packet.
+                if (wait == WAIT_OBJECT_0 + 1) {
+                    threadFailure = RenderOneBuffer(true);
+                    if (FAILED(threadFailure)) break;
+                } else if (wait == WAIT_TIMEOUT && client_) {
+                    UINT32 padding{};
+                    threadFailure = client_->GetCurrentPadding(&padding);
+                    if (FAILED(threadFailure)) break;
+                }
+                continue;
+            }
+            if (wasKeepAlivePaused) {
+                // Only the render thread owns this non-atomic watchdog state
+                // while a keep-alive pause retains the worker.
+                drainWaitStartedTick_ = 0;
+                drainElapsedMs_.store(0, std::memory_order_relaxed);
+                wasKeepAlivePaused = false;
+            }
+            const bool draining = clock_ && EndOfStreamSubmitted();
             if (draining) {
                 // No more GetBuffer/Fill after the terminal buffer. The timeout
                 // only schedules a clock read; wall time never proves drain.
@@ -690,6 +745,24 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
                 continue;
             }
             if (waitingForSource_.load(std::memory_order_acquire)) {
+                if (config_.keepRunningOnStarvation &&
+                    clockStartGeneration_.load(std::memory_order_acquire) != 0) {
+                    // This waiting stream is still physically running. A
+                    // producer notification is only a hint; real audio events
+                    // remain the sole grants for GetBuffer/ReleaseBuffer.
+                    if (wait == WAIT_OBJECT_0 + 1) {
+                        const bool blocked = resumeBlocked_.load(std::memory_order_acquire);
+                        threadFailure = RenderOneBuffer(blocked);
+                        if (blocked) waitingForSource_.store(true, std::memory_order_release);
+                        if (FAILED(threadFailure) && threadFailure != kAudioSourceWouldBlock) break;
+                        threadFailure = S_OK;
+                    } else if (wait == WAIT_TIMEOUT && client_) {
+                        UINT32 padding{};
+                        threadFailure = client_->GetCurrentPadding(&padding);
+                        if (FAILED(threadFailure)) break;
+                    }
+                    continue;
+                }
                 if (resumeBlocked_.load(std::memory_order_acquire)) continue;
                 const bool sourceSignal = config_.sourceReadyEvent
                     ? wait == WAIT_OBJECT_0 + 2
@@ -810,6 +883,27 @@ DWORD WasapiExclusiveSink::RenderThreadMain() noexcept {
 }
 
 void WasapiExclusiveSink::Pause() noexcept {
+    if (keepAlivePaused_.load(std::memory_order_acquire)) return;
+    if (config_.keepRunningOnPause && clock_) {
+        bool keptAlive = false;
+        {
+            std::lock_guard transition(pauseTransitionMutex_);
+            auto expected = WasapiSinkState::Running;
+            const bool runningWait = config_.keepRunningOnStarvation &&
+                clockStartGeneration_.load(std::memory_order_acquire) != 0;
+            if (renderThread_ && (!waitingForSource_.load(std::memory_order_acquire) || runningWait) &&
+                !stopRequested_.load(std::memory_order_acquire) &&
+                state_.compare_exchange_strong(expected, WasapiSinkState::Open,
+                                               std::memory_order_acq_rel)) {
+                keepAlivePaused_.store(true, std::memory_order_release);
+                keptAlive = true;
+            }
+        }
+        if (keptAlive) {
+            NotifyLifecycle(WasapiSinkLifecycleEvent::PauseKeepAlive, S_OK);
+            return;
+        }
+    }
     StopInternal(clock_ != nullptr);
 }
 
@@ -843,6 +937,7 @@ void WasapiExclusiveSink::StopInternal(bool preserveBuffer) noexcept {
         CloseHandle(renderThread_);
         renderThread_ = nullptr;
     }
+    keepAlivePaused_.store(false, std::memory_order_release);
     source_ = nullptr;
     if (!preserveBuffer) waitingForSource_.store(false, std::memory_order_release);
     resumeBlocked_.store(false, std::memory_order_release);

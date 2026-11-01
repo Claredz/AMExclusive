@@ -1438,8 +1438,16 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
         {
             ControlScope lock(*this);
             nextDiagnosticTelemetryTick_ = 0;
-            if (graphBound_ && coordinator_.SinkState() == WasapiSinkState::Faulted) {
+            // A producer queue failure faults the gate even when the endpoint
+            // is merely Open/paused. Reap it through the same fatal path as a
+            // render failure, or its committed native-output latch can survive
+            // sleep/resume indefinitely while no producer can capture again.
+            const bool gateFaulted = coordinator_.Phase() == AudioCoreGatePhase::Faulted;
+            if (graphBound_ && (coordinator_.SinkState() == WasapiSinkState::Faulted ||
+                                gateFaulted)) {
                 HRESULT sinkError = coordinator_.Sink().Stats().lastError;
+                if (SUCCEEDED(sinkError) && gateFaulted && coordinator_.Stats().droppedFrames != 0)
+                    sinkError = HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
                 if (SUCCEEDED(sinkError)) sinkError = E_UNEXPECTED;
                 uiEnabled_.store(false, std::memory_order_release);
                 Emit(AudioCoreRuntimeEvent::Faulted, sinkError);
@@ -1474,7 +1482,9 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
             nativePumpBufferedFrames_.store(
                 graphBound_ ? static_cast<std::uint64_t>(coordinator_.BufferedFrames()) : 0,
                 std::memory_order_release);
-            if (coordinator_.Phase() == AudioCoreGatePhase::Active) {
+            // Capturing diagnostics expose an activation stall as well as
+            // healthy Active playback; previously Probing produced no ticks.
+            if (graphBound_) {
                 const auto now = GetTickCount64();
                 if (nextTelemetryTick_ == 0 || now >= nextTelemetryTick_) {
                     nextTelemetryTick_ = now + 5000;
@@ -1625,7 +1635,7 @@ AudioCoreRuntimeStats AudioCoreRuntime::Stats() const noexcept {
     pcmFill.lastProducedPackets = lastProducedPackets_.load(std::memory_order_acquire);
     return AudioCoreRuntimeStats{
         coordinator.BufferedFrames(), coordinator.Stats(), tap_.Stats(), coordinator.Sink().Stats(),
-        pcmFill,
+        pcmFill, userPauseIntent_, playbackStateAvailable_,
     };
 }
 
@@ -1696,6 +1706,8 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     AudioCoreCoordinatorConfig config{};
     config.sink.format = format;
     config.sink.allowResampling = allowConversion;
+    config.sink.keepRunningOnPause = true;
+    config.sink.keepRunningOnStarvation = true;
     // A new generation after a known pause reopens the physical stream. Keep
     // its first period silent before submitting the unchanged music samples;
     // same-graph Pause/Start and ordinary EOF handoffs do not use this path.
@@ -1749,6 +1761,17 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
         Emit(AudioCoreRuntimeEvent::Faulted, error);
         RetireCaptureLocked(true);
         return;
+    }
+    // If the canonical observer is unavailable, a row selection followed by
+    // a real replacement bind is the legacy Play evidence. Apple does not
+    // always send the matching skip notification. Do not let the previous
+    // generation's pause strand that selected stream in Capturing. A known
+    // Paused snapshot, or a rebind without a selection, keeps its authority.
+    if (!playbackStateAvailable_ && userPauseIntent_ &&
+        directSelectionArmEpoch_.load(std::memory_order_acquire) != 0 &&
+        GetTickCount64() <= directSelectionArmDeadlineTick_.load(std::memory_order_acquire)) {
+        userPauseIntent_ = false;
+        nativeStartedAfterUserPause_ = false;
     }
     // Cut over only after roughly 100 ms is already captured. A single 20 ms
     // device period was too easy to drain during transient CPU scheduling load;

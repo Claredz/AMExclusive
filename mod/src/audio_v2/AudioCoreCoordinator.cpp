@@ -89,9 +89,9 @@ void AudioCoreCoordinator::Disable() noexcept {
 bool AudioCoreCoordinator::PushResult(bool pushed, std::uint32_t frames) noexcept {
     if (pushed) {
         capturedFrames_.fetch_add(frames, std::memory_order_relaxed);
-        // The producer notification exists only to restart a sink that had to
-        // stop for source starvation. Signaling it for every healthy P0 block
-        // needlessly wakes the real-time render thread at producer cadence.
+        // Notify a source-starved sink, including the initially empty path.
+        // A running keep-alive sink still writes only on device events.
+        // Healthy playback does not need producer-cadence wakeups.
         if (sourceReadyEvent_ && sink_.WaitingForSource()) SetEvent(sourceReadyEvent_);
     } else {
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);

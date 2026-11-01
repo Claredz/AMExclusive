@@ -1912,12 +1912,15 @@ void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntim
         const auto& fill = stats.pcmFill;
         Log(L"audio core v2 telemetry capturedFrames=" +
             std::to_wstring(stats.coordinator.capturedFrames) +
+            L" userPaused=" + std::to_wstring(stats.userPaused) +
+            L" playbackStateAvailable=" + std::to_wstring(stats.playbackStateAvailable) +
             L" acceptedFrames=" + std::to_wstring(tap.acceptedFrames) +
             L" bufferedFrames=" + std::to_wstring(stats.bufferedFrames) +
             L" submittedFrames=" + std::to_wstring(sink.submittedFrames) +
             L" submittedBuffers=" + std::to_wstring(sink.submittedBuffers) +
             L" controlledSilenceFrames=" + std::to_wstring(sink.controlledSilenceFrames) +
             L" sourceWaits=" + std::to_wstring(sink.sourceWaits) +
+            L" clientStarts=" + std::to_wstring(sink.clientStarts) +
             L" droppedFrames=" + std::to_wstring(stats.coordinator.droppedFrames) +
             L" sourceMappingFailures=" + std::to_wstring(stats.coordinator.source.mappingFailures) +
             L" integerizedSamples=" + std::to_wstring(stats.coordinator.source.integerizedSamples) +
@@ -2679,11 +2682,16 @@ AppleOSStatus __cdecl HookV2AudioConverterReset(void* converter) {
             const auto value = reinterpret_cast<std::uintptr_t>(address);
             return agentBase && value >= agentBase ? value - agentBase : 0;
         };
-        localSeekReset = count >= 3 &&
-            rva(resetStack[0]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame0 &&
-            rva(resetStack[1]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame1 &&
-            (rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[0] ||
-             rva(resetStack[2]) == ammod::apple_private::agent_stack::kLocalSeekResetFrame2[1]);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(agentBase);
+        if (count >= 3 && dos && dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0) {
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(agentBase + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                localSeekReset = ammod::apple_private::agent_stack::IsLocalSeekReset(
+                    nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage,
+                    {rva(resetStack[0]), rva(resetStack[1]), rva(resetStack[2])});
+            }
+        }
     }
     const bool trackedP0 = g_nativeP0Puller.Tracks(converter);
     if (trackedP0) g_nativeP0Puller.PauseForReset(converter);
@@ -3151,6 +3159,8 @@ const wchar_t* WasapiSinkLifecycleText(
     case Event::StopExit: return L"StopExit";
     case Event::CloseEnter: return L"CloseEnter";
     case Event::CloseExit: return L"CloseExit";
+    case Event::PauseKeepAlive: return L"PauseKeepAlive";
+    case Event::ResumeKeepAlive: return L"ResumeKeepAlive";
     }
     return L"Unknown";
 }

@@ -7,6 +7,9 @@
 /mod/tests/*
 !/mod/tests/WasapiDrainProbe.cpp
 !/mod/tests/README.md
+!/mod/tests/CompatibilityTests.cpp
+!/mod/tests/RuntimeTests.cpp
+!/mod/tests/WasapiPauseProbe.cpp
 /mod/src/Controller.cpp
 /mod/src/PcmProbeDll.cpp
 /mod/src/audio_v2/FinalPcmDump.cpp

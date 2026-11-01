@@ -17,9 +17,9 @@ class IIntegerPcmSource {
 public:
     virtual ~IIntegerPcmSource() = default;
 
-    // A sink must not acquire an endpoint buffer unless the source can fill
-    // the complete period, or has reached an explicit end-of-stream tail.
-    // This keeps a network wait from becoming fabricated output samples.
+    // Media packets require a complete source period or an explicit EOS tail.
+    // An opt-in device keep-alive may submit separately counted silence while
+    // waiting, without calling Fill or claiming those frames as source media.
     virtual bool CanProvide(std::uint32_t capacityFrames) const noexcept {
         return capacityFrames != 0;
     }

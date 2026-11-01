@@ -6,8 +6,10 @@
 #include <winrt/Microsoft.UI.Xaml.Data.h>
 
 // Read-only ABI prefixes from AMP.Services.winmd in Apple Music 1.6.4.90
-// (package 1.1540.23042.0). Keep the declared method order and IIDs identical
-// to that metadata. Trailing methods are unused and intentionally omitted.
+// (1.1540.23042.0) and 1.7.0.155 (1.1792.39682.0). The latter adds trailing
+// members and changes the IPlayer/INowPlayingItem IIDs; their consumed prefixes
+// are unchanged. Query only recorded IIDs, never reinterpret an unknown ABI.
+// Trailing methods are unused and intentionally omitted.
 // These declarations let standalone builds observe the existing player
 // without redistributing Apple's metadata or generating its full projection.
 namespace ammod::apple_private::playback {
@@ -17,10 +19,13 @@ struct __declspec(uuid("34D100F9-0F0A-5980-8F04-7AF57FDB29B0")) IPlayerStatics :
     virtual HRESULT __stdcall get_Current(void**) noexcept = 0;
 };
 
-struct __declspec(uuid("958DA6F6-2E93-5BA7-B604-28DD57FEB8E0")) IPlayer : ::IInspectable {
+struct IPlayerPrefix : ::IInspectable {
     virtual HRESULT __stdcall get_NowPlayingItem(void**) noexcept = 0;
     virtual HRESULT __stdcall get_PlayerState(void**) noexcept = 0;
 };
+
+struct __declspec(uuid("958DA6F6-2E93-5BA7-B604-28DD57FEB8E0")) IPlayer : IPlayerPrefix {};
+struct __declspec(uuid("F807B158-B2E7-5CF7-A512-8B0BE767DF1B")) IPlayer17 : IPlayerPrefix {};
 
 struct __declspec(uuid("BEFB99EB-336F-5199-9FB2-63635BC47319")) IPlayerState : ::IInspectable {
     virtual HRESULT __stdcall get_CanPlay(bool*) noexcept = 0;
@@ -45,7 +50,7 @@ struct __declspec(uuid("BEFB99EB-336F-5199-9FB2-63635BC47319")) IPlayerState : :
     virtual HRESULT __stdcall get_IsPlaying(bool*) noexcept = 0;
 };
 
-struct __declspec(uuid("E376ACB7-0569-56C5-8443-A288ACD362EA")) INowPlayingItem : ::IInspectable {
+struct INowPlayingItemPrefix : ::IInspectable {
     virtual HRESULT __stdcall get_Subtitle(void**) noexcept = 0;
     virtual HRESULT __stdcall get_Artist(void**) noexcept = 0;
     virtual HRESULT __stdcall get_Album(void**) noexcept = 0;
@@ -88,7 +93,19 @@ struct __declspec(uuid("E376ACB7-0569-56C5-8443-A288ACD362EA")) INowPlayingItem 
     virtual HRESULT __stdcall get_PlayQueueItemID(std::uint64_t*) noexcept = 0;
 };
 
+struct __declspec(uuid("E376ACB7-0569-56C5-8443-A288ACD362EA")) INowPlayingItem : INowPlayingItemPrefix {};
+struct __declspec(uuid("2DC5F65C-28F6-58AA-87CF-E4A7DF9B9A4B")) INowPlayingItem17 : INowPlayingItemPrefix {};
+
 } // namespace abi
+
+template<typename Prefix, typename Legacy, typename Current>
+winrt::com_ptr<Prefix> CompatibleInterface(
+    winrt::Windows::Foundation::IInspectable const& object) {
+    winrt::com_ptr<Prefix> prefix;
+    if (auto current = object.try_as<Current>()) prefix.attach(current.detach());
+    else prefix.attach(object.as<Legacy>().detach());
+    return prefix;
+}
 
 struct ObservableObject : winrt::Windows::Foundation::IInspectable {
     using IInspectable::IInspectable;
@@ -124,7 +141,9 @@ struct NowPlayingItem : ObservableObject {
 
     std::uint64_t PlayQueueItemID() const {
         std::uint64_t value{};
-        winrt::check_hresult(as<abi::INowPlayingItem>()->get_PlayQueueItemID(&value));
+        auto item = CompatibleInterface<abi::INowPlayingItemPrefix,
+            abi::INowPlayingItem, abi::INowPlayingItem17>(*this);
+        winrt::check_hresult(item->get_PlayQueueItemID(&value));
         return value;
     }
 };
@@ -141,13 +160,15 @@ struct Player : ObservableObject {
 
     playback::PlayerState PlayerState() const {
         void* value{};
-        winrt::check_hresult(as<abi::IPlayer>()->get_PlayerState(&value));
+        auto player = CompatibleInterface<abi::IPlayerPrefix, abi::IPlayer, abi::IPlayer17>(*this);
+        winrt::check_hresult(player->get_PlayerState(&value));
         return {value, winrt::take_ownership_from_abi};
     }
 
     playback::NowPlayingItem NowPlayingItem() const {
         void* value{};
-        winrt::check_hresult(as<abi::IPlayer>()->get_NowPlayingItem(&value));
+        auto player = CompatibleInterface<abi::IPlayerPrefix, abi::IPlayer, abi::IPlayer17>(*this);
+        winrt::check_hresult(player->get_NowPlayingItem(&value));
         return {value, winrt::take_ownership_from_abi};
     }
 };

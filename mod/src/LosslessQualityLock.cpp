@@ -36,6 +36,7 @@ SimpleFactory originalCreate{};
 using TreeApply = std::int32_t(__cdecl*)(void*, void*, void**, void*);
 TreeApply originalTreeApply{};
 std::uintptr_t mediaBase{};
+const ammod::apple_private::core_media_filter::BuildProfile* mediaBuild{};
 double(__cdecl* maxSampleRate)(void*){};
 void*(__cdecl* arrayCreate)(void*, const void**, std::int64_t, const void*){};
 const void*(__cdecl* arrayValue)(const void*, std::int64_t){};
@@ -319,11 +320,11 @@ bool CollectStrict(void* filter, std::vector<void*>& strict, unsigned depth = 0)
         !TryReadWord(methods, offsets::kTreeApplySlot, treeApply)) {
         return false;
     }
-    if (simpleApply == mediaBase + offsets::kSimpleApplyRva) {
+    if (simpleApply == mediaBase + mediaBuild->simpleApplyRva) {
         std::uintptr_t predicate{};
         if (!TryReadWord(filter, offsets::kSimplePredicate, predicate)) return false;
         if (predicate == reinterpret_cast<std::uintptr_t>(&Accept)) strict.push_back(filter);
-    } else if (treeApply == mediaBase + offsets::kTreeApplyRva) {
+    } else if (treeApply == mediaBase + mediaBuild->treeApplyRva) {
         std::uintptr_t childrenWord{};
         std::uintptr_t fallbackWord{};
         if (!TryReadWord(filter, offsets::kTreeChildren, childrenWord) ||
@@ -432,23 +433,21 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
 // permanently unavailable in this process instead of detouring unknown code.
 std::atomic<bool> imageRejected{};
 
-bool ImageMatchesVerifiedBuild(HMODULE media) {
+const ammod::apple_private::core_media_filter::BuildProfile*
+MatchVerifiedBuild(HMODULE media) {
     namespace offsets = ammod::apple_private::core_media_filter;
     const auto* base = reinterpret_cast<const std::uint8_t*>(media);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return false;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return nullptr;
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        return false;
+        return nullptr;
     }
     const std::uintptr_t imageSize = nt->OptionalHeader.SizeOfImage;
-    const auto matches = [&](std::uintptr_t rva, const auto& prologue) {
-        return rva + prologue.size() <= imageSize &&
-               std::memcmp(base + rva, prologue.data(), prologue.size()) == 0;
-    };
-    const bool ok = matches(offsets::kSimpleApplyRva, offsets::kSimpleApplyPrologue) &&
-                    matches(offsets::kTreeApplyRva, offsets::kTreeApplyPrologue);
+    const auto* build = offsets::MatchVerifiedImage(nt->FileHeader.TimeDateStamp,
+        std::span<const std::uint8_t>{base, imageSize});
+    const bool ok = build != nullptr;
     if (!ok && writeLog) {
         wchar_t text[192]{};
         std::swprintf(text, std::size(text),
@@ -458,7 +457,7 @@ bool ImageMatchesVerifiedBuild(HMODULE media) {
                       static_cast<unsigned>(nt->OptionalHeader.SizeOfImage));
         writeLog(text);
     }
-    return ok;
+    return ok ? build : nullptr;
 }
 
 } // namespace
@@ -472,7 +471,8 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     if (installed) return true;
     if (imageRejected.load(std::memory_order_acquire)) return false;
     writeLog = log;
-    if (!ImageMatchesVerifiedBuild(media)) {
+    const auto* build = MatchVerifiedBuild(media);
+    if (!build) {
         imageRejected.store(true, std::memory_order_release);
         return false;
     }
@@ -499,13 +499,16 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     const auto status = MH_EnableHook(target);
     if (status != MH_OK && status != MH_ERROR_ENABLED) return false;
     mediaBase = reinterpret_cast<std::uintptr_t>(media);
-    auto* treeTarget = reinterpret_cast<void*>(mediaBase +
-        ammod::apple_private::core_media_filter::kTreeApplyRva);
+    mediaBuild = build;
+    auto* treeTarget = reinterpret_cast<void*>(mediaBase + build->treeApplyRva);
     if (!originalTreeApply && MH_CreateHook(treeTarget, reinterpret_cast<void*>(ApplyTree),
         reinterpret_cast<void**>(&originalTreeApply)) != MH_OK) return false;
     const auto treeStatus = MH_EnableHook(treeTarget);
     installed = treeStatus == MH_OK || treeStatus == MH_ERROR_ENABLED;
-    if (installed && writeLog) writeLog(L"Highest ALAC quality filter hook ready");
+    if (installed && writeLog) {
+        writeLog(L"Highest ALAC quality filter hook ready; verified Apple Music " +
+                 std::wstring(build->appleMusicVersion));
+    }
     return installed;
 }
 

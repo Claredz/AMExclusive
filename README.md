@@ -22,6 +22,24 @@ AMExclusive (AME) is an open-source project designed specifically for Apple Musi
 
 This project has only been validated with the development and test versions listed above. Its behavior on other Apple Music versions is not guaranteed.
 
+### Local compatibility revision 1.7.3
+
+This local revision adds recorded x64 compatibility profiles for Apple Music
+`1.7.0.155` / package `1.1792.39682.0` while retaining the `1.6.4.90` profile.
+It updates the read-only player interfaces, guarded CoreMedia addresses and
+local-seek fingerprints, and fixes selected-track recovery after observer loss
+and cleanup of producer-faulted generations. See [COMPATIBILITY.md](COMPATIBILITY.md)
+for the binary evidence, regression commands and validation limits. This is a
+local patch based on upstream tag `1.7`, not an upstream release.
+
+The revision also keeps a running exclusive device clocked with silence during
+short user pauses, preserving queued media instead of triggering an affected
+USB driver's broken Stop/Start cadence.
+
+It also retains that clock through temporary producer gaps after first Start,
+including the brief delivery gap observed after Modern Standby/display wake.
+Initial-empty streams continue waiting for real media before the first Start.
+
 ## Features
 
 1. **WASAPI exclusive output**  

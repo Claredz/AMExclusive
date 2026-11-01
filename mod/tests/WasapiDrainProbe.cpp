@@ -2,6 +2,7 @@
 // Build target am_exclusive_drain_probe, then run with --run-on-default-device.
 #include "audio_v2/WasapiExclusiveSink.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 using namespace ammod::audio_v2;
 
@@ -55,6 +56,8 @@ bool Run(unsigned rate, unsigned bits, bool wait, unsigned tail, bool pause,
     WasapiSinkConfig config;
     config.format = {rate, 2, static_cast<std::uint16_t>(bits), static_cast<std::uint16_t>(bits)};
     config.periodFrames = rate * 30 / 1000;
+    config.keepRunningOnPause = true;
+    config.keepRunningOnStarvation = true;
     config.sourceReadyEvent = notified ? ready.handle : nullptr;
     auto hr = sink.Open(config);
     std::printf("OPEN rate=%u bits=%u wait=%d tail=%u pause=%d notify=%d initialWait=%d fills=%u sealedEmpty=%d hr=%08lx frames=%u\n",
@@ -94,8 +97,10 @@ bool Run(unsigned rate, unsigned bits, bool wait, unsigned tail, bool pause,
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2 || std::strcmp(argv[1], "--run-on-default-device") != 0) {
-        std::puts("Explicit opt-in required: --run-on-default-device (exclusive silent audio)");
+    const unsigned onlyRate = argc == 3 ? static_cast<unsigned>(std::strtoul(argv[2], nullptr, 10)) : 0;
+    if ((argc != 2 && argc != 3) || std::strcmp(argv[1], "--run-on-default-device") != 0 ||
+        (argc == 3 && onlyRate != 44100 && onlyRate != 96000 && onlyRate != 192000)) {
+        std::puts("Explicit opt-in: --run-on-default-device [44100|96000|192000] (exclusive silence)");
         return 2;
     }
     int failures = 0;
@@ -108,6 +113,7 @@ int main(int argc, char** argv) {
             ++failures;
     };
     for (unsigned rate : {192000u, 96000u, 44100u}) {
+        if (onlyRate && rate != onlyRate) continue;
         for (bool wait : {false, true}) {
             for (unsigned tail : {0u, 1u, 2u})
                 run(rate, 24, wait, tail, false);

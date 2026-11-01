@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,8 @@ enum class WasapiSinkLifecycleEvent : std::uint8_t {
     StopExit,
     CloseEnter,
     CloseExit,
+    PauseKeepAlive,
+    ResumeKeepAlive,
 };
 
 using WasapiSinkLifecycleCallback = void (*)(
@@ -44,6 +47,12 @@ struct WasapiSinkConfig final {
     // One zero-filled device period before the first media packet. Opt-in
     // for an endpoint rebuilt after pause; never consume/drop source frames.
     bool primeWithSilence{};
+    // Keep the physical stream clocked with silence during a logical pause.
+    // Some USB devices resume a stopped stream at a wrong packet cadence.
+    bool keepRunningOnPause{};
+    // Once playback has started, keep clocking silence through temporary
+    // producer gaps as well. Initial-empty streams still wait before Start.
+    bool keepRunningOnStarvation{};
     // Non-owning producer notification. The coordinator owns this handle and
     // keeps it valid until the sink has stopped and closed.
     HANDLE sourceReadyEvent{};
@@ -119,7 +128,7 @@ private:
 
     HRESULT ActivateClient() noexcept;
     HRESULT InitializeClient() noexcept;
-    HRESULT RenderOneBuffer() noexcept;
+    HRESULT RenderOneBuffer(bool pauseSilence = false) noexcept;
     HRESULT CheckEndOfStreamDrain() noexcept;
     HRESULT ReadClockPosition(std::uint64_t& position) noexcept;
     bool FramesToClockTicks(std::uint64_t frames, std::uint64_t& ticks) const noexcept;
@@ -132,6 +141,8 @@ private:
     void ReleaseComInitialization() noexcept;
 
     WasapiSinkConfig config_{};
+    std::atomic<bool> keepAlivePaused_{};
+    std::mutex pauseTransitionMutex_;
     WAVEFORMATEXTENSIBLE waveFormat_{};
     std::vector<std::int32_t> canonicalBuffer_;
 

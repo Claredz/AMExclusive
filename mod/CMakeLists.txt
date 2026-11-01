@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.1.0 LANGUAGES CXX RC)
+project(AMExclusive VERSION 1.7.3 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -15,6 +15,13 @@ add_executable(am_exclusive_drain_probe EXCLUDE_FROM_ALL
 target_include_directories(am_exclusive_drain_probe PRIVATE src)
 target_compile_definitions(am_exclusive_drain_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(am_exclusive_drain_probe PRIVATE ole32 uuid avrt)
+
+# Explicit opt-in only: measures short-pause device cadence using silence.
+add_executable(am_exclusive_pause_probe EXCLUDE_FROM_ALL
+  tests/WasapiPauseProbe.cpp src/audio_v2/WasapiExclusiveSink.cpp)
+target_include_directories(am_exclusive_pause_probe PRIVATE src)
+target_compile_definitions(am_exclusive_pause_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(am_exclusive_pause_probe PRIVATE ole32 uuid avrt)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -147,6 +154,36 @@ set_target_properties(am_exclusive_setup PROPERTIES OUTPUT_NAME "AMExclusive-Set
 if(MSVC)
   target_compile_options(am_exclusive_setup PRIVATE /W4 /permissive- /EHsc /guard:cf /utf-8)
   target_link_options(am_exclusive_setup PRIVATE /guard:cf)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(am_exclusive_compatibility_tests tests/CompatibilityTests.cpp)
+  add_dependencies(am_exclusive_compatibility_tests generate_winui_projection)
+  target_include_directories(am_exclusive_compatibility_tests PRIVATE src "${WINRT_GENERATED_DIR}")
+  target_compile_definitions(am_exclusive_compatibility_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(am_exclusive_compatibility_tests PRIVATE ole32 runtimeobject windowsapp)
+  if(EXISTS "${APPLE_MUSIC_PACKAGE_DIR}/AMP.Services.winmd")
+    target_compile_definitions(am_exclusive_compatibility_tests PRIVATE AMEX_CHECK_APPLE_PROJECTION)
+  endif()
+  add_test(NAME compatibility COMMAND am_exclusive_compatibility_tests)
+  if(EXISTS "${APPLE_MUSIC_PACKAGE_DIR}/CoreMedia.dll")
+    add_test(NAME installed_coremedia_profile COMMAND am_exclusive_compatibility_tests
+      "${APPLE_MUSIC_PACKAGE_DIR}/CoreMedia.dll")
+  endif()
+
+  add_executable(am_exclusive_runtime_tests tests/RuntimeTests.cpp
+    src/audio_v2/AudioCoreRuntime.cpp src/audio_v2/AudioCoreCoordinator.cpp
+    src/audio_v2/ResampledPcmSource.cpp src/audio_v2/WasapiExclusiveSink.cpp)
+  target_include_directories(am_exclusive_runtime_tests PRIVATE src
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
+  target_compile_definitions(am_exclusive_runtime_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(am_exclusive_runtime_tests PRIVATE ole32 uuid avrt)
+  add_test(NAME runtime_regressions COMMAND am_exclusive_runtime_tests)
+  if(MSVC)
+    target_compile_options(am_exclusive_compatibility_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_compile_options(am_exclusive_runtime_tests PRIVATE /W4 /permissive- /EHsc /utf-8 /wd4324)
+  endif()
 endif()
 
 install(TARGETS

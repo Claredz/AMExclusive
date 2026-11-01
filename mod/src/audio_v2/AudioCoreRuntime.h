@@ -99,6 +99,8 @@ struct AudioCoreRuntimeStats final {
     ApplePcmTapStats tap{};
     WasapiSinkStats sink{};
     AudioCorePcmFillStats pcmFill{};
+    bool userPaused{};
+    bool playbackStateAvailable{};
 };
 
 struct AudioCoreRuntimeEventSnapshot final {
